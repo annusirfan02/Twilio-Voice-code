@@ -1,0 +1,9 @@
+{
+  "name": "twilio-transcribe-summarize",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Vercel serverless function: downloads a Twilio call recording, transcribes it with OpenAI Whisper, summarizes it with GPT, and calls back to a Zapier webhook.",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
