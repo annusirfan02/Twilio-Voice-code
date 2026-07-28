@@ -47,9 +47,10 @@ export default async function handler(req, res) {
   const { RecordingUrl, RecordingSid, CallSid, messageId } = JSON.parse(rawBody);
 
   try {
-    // ---------- 1. GHL se From/To number lo messageId se ----------
-    let From = null;
-    let To = null;
+    // ---------- 1. GHL se From/To number aur contactId lo messageId se ----------
+    let From = 'unknown';
+    let To = 'unknown';
+    let contactId = null;
 
     if (messageId) {
       const msgRes = await fetch(
@@ -65,19 +66,16 @@ export default async function handler(req, res) {
 
       if (msgRes.ok) {
         const msgData = await msgRes.json();
-        // GHL message object mein from/to hote hain
-        From = msgData?.message?.from || msgData?.from || null;
-        To   = msgData?.message?.to   || msgData?.to   || null;
+        const msg = msgData?.message || msgData;
+        From      = msg?.from      || 'unknown';
+        To        = msg?.to        || 'unknown';
+        contactId = msg?.contactId || null;  // directly mil gaya — search ki zaroorat nahi
       } else {
         console.warn(`GHL message fetch failed: ${msgRes.status}`);
       }
     }
 
-    // Fallback agar number nahi mila
-    if (!From) From = 'unknown';
-    if (!To)   To   = 'unknown';
-
-    console.log(`Processing call — From: ${From}, To: ${To}, MessageId: ${messageId}`);
+    console.log(`Processing call — From: ${From}, To: ${To}, ContactId: ${contactId}`);
 
     // ---------- 2. Twilio recording download ----------
     const twilioAuth = Buffer.from(
@@ -146,53 +144,56 @@ export default async function handler(req, res) {
     const gptData = await gptRes.json();
     const summary = gptData.choices[0].message.content;
 
-    // ---------- 5a. GHL mein contact dhundho To number se ----------
-    const searchPhone = To !== 'unknown' ? To : From;
-
-    const searchRes = await fetch(
-      `https://services.leadconnectorhq.com/contacts/search/duplicate?locationId=${process.env.GHL_LOCATION_ID}&phone=${encodeURIComponent(searchPhone)}`,
-      {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${process.env.GHL_API_KEY}`,
-          Version: '2021-07-28',
-        },
-      }
-    );
-
-    if (!searchRes.ok) {
-      const errText = await searchRes.text();
-      throw new Error(`GHL contact search failed: ${errText}`);
-    }
-
-    const searchData = await searchRes.json();
-    let contactId = searchData?.contact?.id;
-
-    // ---------- 5b. Agar contact nahi mila toh naya banao ----------
+    // ---------- 5a. GHL contact — messageId se contactId already mila hua hai ----------
+    // Agar messageId se nahi mila toh phone number se search karo
     if (!contactId) {
-      const createRes = await fetch(
-        'https://services.leadconnectorhq.com/contacts/',
+      const searchPhone = To !== 'unknown' ? To : From;
+
+      const searchRes = await fetch(
+        `https://services.leadconnectorhq.com/contacts/search/duplicate?locationId=${process.env.GHL_LOCATION_ID}&phone=${encodeURIComponent(searchPhone)}`,
         {
-          method: 'POST',
+          method: 'GET',
           headers: {
             Authorization: `Bearer ${process.env.GHL_API_KEY}`,
             Version: '2021-07-28',
-            'Content-Type': 'application/json',
           },
-          body: JSON.stringify({
-            locationId: process.env.GHL_LOCATION_ID,
-            phone: searchPhone,
-          }),
         }
       );
 
-      if (!createRes.ok) {
-        const errText = await createRes.text();
-        throw new Error(`GHL contact create failed: ${errText}`);
+      if (!searchRes.ok) {
+        const errText = await searchRes.text();
+        throw new Error(`GHL contact search failed: ${errText}`);
       }
 
-      const createData = await createRes.json();
-      contactId = createData?.contact?.id;
+      const searchData = await searchRes.json();
+      contactId = searchData?.contact?.id;
+
+      // ---------- 5b. Agar contact nahi mila toh naya banao ----------
+      if (!contactId) {
+        const createRes = await fetch(
+          'https://services.leadconnectorhq.com/contacts/',
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${process.env.GHL_API_KEY}`,
+              Version: '2021-07-28',
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              locationId: process.env.GHL_LOCATION_ID,
+              phone: searchPhone,
+            }),
+          }
+        );
+
+        if (!createRes.ok) {
+          const errText = await createRes.text();
+          throw new Error(`GHL contact create failed: ${errText}`);
+        }
+
+        const createData = await createRes.json();
+        contactId = createData?.contact?.id;
+      }
     }
 
     // ---------- 5c. Contact ki Notes mein summary add karo ----------
