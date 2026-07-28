@@ -1,7 +1,10 @@
 {
   "functions": {
     "api/transcribe.js": {
-      "maxDuration": 60
+      "maxDuration": 10
+    },
+    "api/process-call.js": {
+      "maxDuration": 300
     }
   }
 }

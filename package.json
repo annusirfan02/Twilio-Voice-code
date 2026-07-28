@@ -1,9 +1,15 @@
 {
-  "name": "twilio-transcribe-summarize",
+  "name": "call-processor",
   "version": "1.0.0",
   "private": true,
-  "description": "Vercel serverless function: downloads a Twilio call recording, transcribes it with OpenAI Whisper, summarizes it with GPT, and calls back to a Zapier webhook.",
+  "description": "Vercel serverless function: downloads a Twilio call recording, transcribes it with OpenAI Whisper, summarizes it with GPT, and upserts contact in LeadConnector (GHL).",
+  "type": "module",
   "engines": {
     "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@upstash/qstash": "^2.7.0",
+    "form-data": "^4.0.0",
+    "node-fetch": "^3.3.2"
   }
 }

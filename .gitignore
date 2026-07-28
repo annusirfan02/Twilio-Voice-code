@@ -1,0 +1,8 @@
+# Environment variables — secret keys hain, GitHub pe nahi jaayengi
+.env
+
+# Node modules
+node_modules/
+
+# Vercel
+.vercel
