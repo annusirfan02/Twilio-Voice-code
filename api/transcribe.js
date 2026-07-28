@@ -1,7 +1,6 @@
 // ============================================================
-// STEP 1: GHL/Twilio recording-status webhook yahan hit karta hai
-// Iska kaam sirf ek hai: turant "OK" bolna aur asli kaam
-// QStash queue ke hawale karna (taake timeout na ho)
+// STEP 1: GHL recording-status webhook yahan hit karta hai
+// Iska kaam: turant "OK" bolna aur asli kaam QStash ko dena
 // ============================================================
 
 import { Client } from '@upstash/qstash';
@@ -14,20 +13,21 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Event Streams / GHL webhook ka nested data format
     const body = req.body;
 
-    // Data parameters nikalo — GHL format mein nested hain
+    // GHL nested format se parameters nikalo
     const parameters = body?.data?.requestData?.parameters || body;
 
     const RecordingUrl    = parameters?.['Recording Url']    || parameters?.RecordingUrl;
     const RecordingSid    = parameters?.['Recording Sid']    || parameters?.RecordingSid;
     const CallSid         = parameters?.['Call Sid']         || parameters?.CallSid;
-    const AccountSid      = parameters?.['Account Sid']      || parameters?.AccountSid;
     const RecordingStatus = parameters?.['Recording Status'] || parameters?.RecordingStatus;
 
-    // Caller number GHL URL se nikalna hoga ya fallback
-    const From = parameters?.From || AccountSid || 'unknown';
+    // messageId GHL source URL se nikalo
+    // Source URL: .../recording-status?phoneCallId=xxx&messageId=yyy
+    const sourceUrl = body?.source || body?.data?.requestUrl || '';
+    const messageIdMatch = sourceUrl.match(/messageId=([^&]+)/);
+    const messageId = messageIdMatch ? messageIdMatch[1] : null;
 
     // Sirf completed recordings process karo
     if (RecordingStatus && RecordingStatus !== 'completed') {
@@ -38,10 +38,10 @@ export default async function handler(req, res) {
       return res.status(200).send('No recording URL found, ignoring');
     }
 
-    // Queue mein job daal do
+    // Queue mein job daal do — messageId bhi saath bhejo
     await qstash.publishJSON({
       url: `${process.env.PUBLIC_APP_URL}/api/process-call`,
-      body: { RecordingUrl, RecordingSid, From, CallSid },
+      body: { RecordingUrl, RecordingSid, CallSid, messageId },
       retries: 3,
     });
 

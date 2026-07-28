@@ -1,9 +1,10 @@
 // ============================================================
 // STEP 2: QStash yahan call karta hai (asli, bhaari kaam yahan hota hai)
-// 1. Twilio se recording download
-// 2. Whisper se transcribe
-// 3. GPT se summarize
-// 4. LeadConnector (GHL) mein contact notes update
+// 1. GHL se messageId ke zariye From/To number lo
+// 2. Twilio se recording download karo
+// 3. Whisper se transcribe karo
+// 4. GPT se summarize karo
+// 5. To number se GHL contact dhundho aur notes mein add karo
 // ============================================================
 
 import fetch from 'node-fetch';
@@ -29,7 +30,7 @@ async function getRawBody(req) {
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method not allowed');
 
-  // --- Security: verify that this request really came from QStash ---
+  // --- Security: QStash signature verify karo ---
   const rawBody = await getRawBody(req);
 
   try {
@@ -43,10 +44,42 @@ export default async function handler(req, res) {
     return res.status(401).send('Invalid signature');
   }
 
-  const { RecordingUrl, From, CallSid } = JSON.parse(rawBody);
+  const { RecordingUrl, RecordingSid, CallSid, messageId } = JSON.parse(rawBody);
 
   try {
-    // ---------- 1. Twilio recording download ----------
+    // ---------- 1. GHL se From/To number lo messageId se ----------
+    let From = null;
+    let To = null;
+
+    if (messageId) {
+      const msgRes = await fetch(
+        `https://services.leadconnectorhq.com/conversations/messages/${messageId}`,
+        {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${process.env.GHL_API_KEY}`,
+            Version: '2021-07-28',
+          },
+        }
+      );
+
+      if (msgRes.ok) {
+        const msgData = await msgRes.json();
+        // GHL message object mein from/to hote hain
+        From = msgData?.message?.from || msgData?.from || null;
+        To   = msgData?.message?.to   || msgData?.to   || null;
+      } else {
+        console.warn(`GHL message fetch failed: ${msgRes.status}`);
+      }
+    }
+
+    // Fallback agar number nahi mila
+    if (!From) From = 'unknown';
+    if (!To)   To   = 'unknown';
+
+    console.log(`Processing call — From: ${From}, To: ${To}, MessageId: ${messageId}`);
+
+    // ---------- 2. Twilio recording download ----------
     const twilioAuth = Buffer.from(
       `${process.env.TWILIO_SID}:${process.env.TWILIO_AUTH_TOKEN}`
     ).toString('base64');
@@ -61,7 +94,7 @@ export default async function handler(req, res) {
 
     const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
 
-    // ---------- 2. Whisper transcription ----------
+    // ---------- 3. Whisper transcription ----------
     const form = new FormData();
     form.append('file', audioBuffer, { filename: 'call.mp3' });
     form.append('model', 'whisper-1');
@@ -85,7 +118,7 @@ export default async function handler(req, res) {
 
     const { text: transcript } = await whisperRes.json();
 
-    // ---------- 3. GPT summarization ----------
+    // ---------- 4. GPT summarization ----------
     const gptRes = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -113,9 +146,11 @@ export default async function handler(req, res) {
     const gptData = await gptRes.json();
     const summary = gptData.choices[0].message.content;
 
-    // ---------- 4a. GHL mein contact dhundho phone number se ----------
+    // ---------- 5a. GHL mein contact dhundho To number se ----------
+    const searchPhone = To !== 'unknown' ? To : From;
+
     const searchRes = await fetch(
-      `https://services.leadconnectorhq.com/contacts/search/duplicate?locationId=${process.env.GHL_LOCATION_ID}&phone=${encodeURIComponent(From)}`,
+      `https://services.leadconnectorhq.com/contacts/search/duplicate?locationId=${process.env.GHL_LOCATION_ID}&phone=${encodeURIComponent(searchPhone)}`,
       {
         method: 'GET',
         headers: {
@@ -133,7 +168,7 @@ export default async function handler(req, res) {
     const searchData = await searchRes.json();
     let contactId = searchData?.contact?.id;
 
-    // ---------- 4b. Agar contact nahi mila toh naya banao ----------
+    // ---------- 5b. Agar contact nahi mila toh naya banao ----------
     if (!contactId) {
       const createRes = await fetch(
         'https://services.leadconnectorhq.com/contacts/',
@@ -146,7 +181,7 @@ export default async function handler(req, res) {
           },
           body: JSON.stringify({
             locationId: process.env.GHL_LOCATION_ID,
-            phone: From,
+            phone: searchPhone,
           }),
         }
       );
@@ -160,8 +195,8 @@ export default async function handler(req, res) {
       contactId = createData?.contact?.id;
     }
 
-    // ---------- 4c. Contact ki Notes mein summary add karo ----------
-    const noteBody = `📞 Call Summary (${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })})\n\n${summary}\n\n---\n📝 Full Transcript:\n${transcript}`;
+    // ---------- 5c. Contact ki Notes mein summary add karo ----------
+    const noteBody = `📞 Call Summary (${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })})\nFrom: ${From} → To: ${To}\n\n${summary}\n\n---\n📝 Full Transcript:\n${transcript}`;
 
     const noteRes = await fetch(
       `https://services.leadconnectorhq.com/contacts/${contactId}/notes`,
@@ -183,12 +218,11 @@ export default async function handler(req, res) {
       throw new Error(`GHL note creation failed: ${errText}`);
     }
 
-    console.log(`Call ${CallSid} processed successfully for ${From}`);
+    console.log(`Call ${CallSid} processed successfully — From: ${From}, To: ${To}`);
     return res.status(200).json({ status: 'done', summary });
 
   } catch (err) {
     console.error('process-call error:', err);
-    // Non-200 return karo taake QStash retry kare
     return res.status(500).json({ error: err.message });
   }
 }
