@@ -1,7 +1,7 @@
 // ============================================================
-// STEP 1: Twilio yahan hit karega jab call/recording khatam ho
+// STEP 1: GHL/Twilio recording-status webhook yahan hit karta hai
 // Iska kaam sirf ek hai: turant "OK" bolna aur asli kaam
-// QStash queue ke hawale karna (taake Twilio timeout na ho)
+// QStash queue ke hawale karna (taake timeout na ho)
 // ============================================================
 
 import { Client } from '@upstash/qstash';
@@ -14,25 +14,41 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { RecordingUrl, RecordingSid, From, To, CallSid } = req.body;
+    // Event Streams / GHL webhook ka nested data format
+    const body = req.body;
 
-    if (!RecordingUrl) {
-      // Recording abhi ready nahi hui, ignore kar do
-      return res.status(200).send('No recording yet, ignoring');
+    // Data parameters nikalo — GHL format mein nested hain
+    const parameters = body?.data?.requestData?.parameters || body;
+
+    const RecordingUrl    = parameters?.['Recording Url']    || parameters?.RecordingUrl;
+    const RecordingSid    = parameters?.['Recording Sid']    || parameters?.RecordingSid;
+    const CallSid         = parameters?.['Call Sid']         || parameters?.CallSid;
+    const AccountSid      = parameters?.['Account Sid']      || parameters?.AccountSid;
+    const RecordingStatus = parameters?.['Recording Status'] || parameters?.RecordingStatus;
+
+    // Caller number GHL URL se nikalna hoga ya fallback
+    const From = parameters?.From || AccountSid || 'unknown';
+
+    // Sirf completed recordings process karo
+    if (RecordingStatus && RecordingStatus !== 'completed') {
+      return res.status(200).send('Recording not completed yet, ignoring');
     }
 
-    // Queue mein job daal do - yeh turant return karega
+    if (!RecordingUrl) {
+      return res.status(200).send('No recording URL found, ignoring');
+    }
+
+    // Queue mein job daal do
     await qstash.publishJSON({
       url: `${process.env.PUBLIC_APP_URL}/api/process-call`,
-      body: { RecordingUrl, RecordingSid, From, To, CallSid },
-      retries: 3, // agar fail ho to 3 baar retry karega apne aap
+      body: { RecordingUrl, RecordingSid, From, CallSid },
+      retries: 3,
     });
 
-    // Twilio ko turant response - isse Twilio timeout nahi hoga
     return res.status(200).send('Queued');
 
   } catch (err) {
-    console.error('call-completed error:', err);
+    console.error('transcribe error:', err);
     return res.status(500).send('Error queuing job');
   }
 }
