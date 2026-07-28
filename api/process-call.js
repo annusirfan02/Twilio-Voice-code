@@ -197,6 +197,10 @@ export default async function handler(req, res) {
     }
 
     // ---------- 5c. Contact ki Notes mein summary add karo ----------
+    if (!contactId) {
+      throw new Error(`No contactId found — cannot add note. From: ${From}, To: ${To}`);
+    }
+
     const noteBody = `📞 Call Summary (${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })})\nFrom: ${From} → To: ${To}\n\n${summary}\n\n---\n📝 Full Transcript:\n${transcript}`;
 
     const noteRes = await fetch(
