@@ -52,10 +52,22 @@ export default async function handler(req, res) {
 
     console.log(`RecordingUrl: ${RecordingUrl}, Status: ${RecordingStatus}`);
 
-    // messageId source URL se nikalo
-    const sourceUrl = body?.source || body?.data?.requestUrl || body?.data?.url || '';
-    const messageIdMatch = sourceUrl.match(/messageId=([^&]+)/);
-    const messageId = messageIdMatch ? messageIdMatch[1] : null;
+    // messageId source URL se nikalo — multiple possible locations check karo
+    const sourceUrl = body?.source          // Twilio Event Streams top-level
+                   || body?.datacontenttype // CloudEvents format
+                   || body?.data?.requestUrl
+                   || body?.data?.url
+                   || body?.requestUrl
+                   || '';
+
+    // Pehle direct messageId field check karo
+    let messageId = body?.data?.messageId || body?.messageId || null;
+
+    // Agar direct nahi mila toh URL se nikalo
+    if (!messageId && sourceUrl) {
+      const messageIdMatch = sourceUrl.match(/messageId=([^&]+)/);
+      messageId = messageIdMatch ? messageIdMatch[1] : null;
+    }
 
     console.log(`MessageId: ${messageId}, SourceUrl: ${sourceUrl}`);
 
