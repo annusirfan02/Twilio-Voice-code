@@ -161,7 +161,7 @@ export default async function handler(req, res) {
     }
 
     // ---------- 4c. Contact ki Notes mein summary add karo ----------
-    const noteBody = `📞 Call Summary (${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })})\n\n${summary}\n\n---\n📝 Full Transcript:\n${transcript}`;
+    const noteBody = `📞 Call Summary (${new Date().toLocaleString('en-AU', { timeZone: 'Australia/Sydney' })})\n\n${summary}\n\n---\n📝 Full Transcript:\n${transcript}`;
 
     const noteRes = await fetch(
       `https://services.leadconnectorhq.com/contacts/${contactId}/notes`,

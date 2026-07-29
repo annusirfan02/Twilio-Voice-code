@@ -4,7 +4,10 @@
       "maxDuration": 10
     },
     "api/process-call.js": {
-      "maxDuration": 300
+      "maxDuration": 10
+    },
+    "api/summarize.js": {
+      "maxDuration": 10
     }
   }
 }

@@ -46,33 +46,33 @@ export default async function handler(req, res) {
     console.log('PARAMETERS:', JSON.stringify(parameters).substring(0, 300));
 
     const RecordingUrl    = parameters?.['Recording Url']    || parameters?.RecordingUrl;
-    const RecordingSid    = parameters?.['Recording Sid']    || parameters?.RecordingSid;
     const CallSid         = parameters?.['Call Sid']         || parameters?.CallSid;
     const RecordingStatus = parameters?.['Recording Status'] || parameters?.RecordingStatus;
 
     console.log(`RecordingUrl: ${RecordingUrl}, Status: ${RecordingStatus}`);
 
-    // messageId source URL se nikalo — multiple possible locations check karo
-    const sourceUrl = body?.source          // Twilio Event Streams top-level
-                   || body?.datacontenttype // CloudEvents format
-                   || body?.data?.requestUrl
-                   || body?.data?.url
-                   || body?.requestUrl
-                   || '';
-
-    // Pehle direct messageId field check karo
+    // messageId — pehle direct fields check karo, phir sirf valid URL fields se nikalo
     let messageId = body?.data?.messageId || body?.messageId || null;
 
-    // Agar direct nahi mila toh URL se nikalo
-    if (!messageId && sourceUrl) {
-      const messageIdMatch = sourceUrl.match(/messageId=([^&]+)/);
-      messageId = messageIdMatch ? messageIdMatch[1] : null;
+    if (!messageId) {
+      // Sirf woh fields check karo jo actual URLs ho sakti hain
+      const urlCandidates = [
+        body?.data?.requestUrl,
+        body?.data?.url,
+        body?.requestUrl,
+      ].filter(Boolean);
+
+      for (const url of urlCandidates) {
+        const match = url.match(/messageId=([^&]+)/);
+        if (match) { messageId = match[1]; break; }
+      }
     }
 
-    console.log(`MessageId: ${messageId}, SourceUrl: ${sourceUrl}`);
+    console.log(`MessageId: ${messageId}`);
 
-    // Sirf completed recordings process karo
-    if (RecordingStatus && RecordingStatus !== 'completed') {
+    // Sirf completed recordings process karo — agar status missing ya non-completed ho, ignore karo
+    if (RecordingStatus !== 'completed') {
+      console.log(`Skipping — RecordingStatus: ${RecordingStatus}`);
       return res.status(200).send('Recording not completed yet, ignoring');
     }
 
@@ -80,12 +80,16 @@ export default async function handler(req, res) {
       return res.status(200).send('No recording URL found, ignoring');
     }
 
-    // Queue mein job daal do
-    await qstash.publishJSON({
+    // Queue mein job daal do — deduplicationId se same call dobara process nahi hogi
+    const publishOptions = {
       url: `${process.env.PUBLIC_APP_URL}/api/process-call`,
-      body: { RecordingUrl, RecordingSid, CallSid, messageId },
+      body: { RecordingUrl, CallSid, messageId },
       retries: 3,
-    });
+    };
+    // Sirf tab deduplicationId set karo jab CallSid actually available ho
+    if (CallSid) publishOptions.deduplicationId = CallSid;
+
+    await qstash.publishJSON(publishOptions);
 
     console.log('Successfully queued to QStash');
     return res.status(200).send('Queued');
