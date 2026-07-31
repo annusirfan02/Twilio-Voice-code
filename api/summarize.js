@@ -46,11 +46,12 @@ export default async function handler(req, res) {
   }
 
   try {
-    // ---------- 1. GHL se From/To aur contactId lo messageId se ----------
+    // ---------- 1. GHL se contactId lo ----------
     let From = 'unknown';
     let To = 'unknown';
     let contactId = null;
 
+    // Pehle messageId se try karo
     if (messageId) {
       const msgRes = await fetch(
         `https://services.leadconnectorhq.com/conversations/messages/${messageId}`,
@@ -71,6 +72,30 @@ export default async function handler(req, res) {
         contactId = msg?.contactId || null;
       } else {
         console.warn(`GHL message fetch failed: ${msgRes.status}`);
+      }
+    }
+
+    // Agar messageId se nahi mila toh CallSid se GHL call record dhundho
+    if (!contactId && CallSid) {
+      const callRes = await fetch(
+        `https://services.leadconnectorhq.com/conversations/calls/${CallSid}`,
+        {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${process.env.GHL_API_KEY}`,
+            Version: '2021-07-28',
+          },
+        }
+      );
+
+      if (callRes.ok) {
+        const callData = await callRes.json();
+        From      = callData?.from      || callData?.callerNumber || 'unknown';
+        To        = callData?.to        || callData?.dialedNumber || 'unknown';
+        contactId = callData?.contactId || null;
+        console.log(`GHL call record found — From: ${From}, To: ${To}, ContactId: ${contactId}`);
+      } else {
+        console.warn(`GHL call fetch failed: ${callRes.status}`);
       }
     }
 
@@ -104,13 +129,14 @@ export default async function handler(req, res) {
     const gptData = await gptRes.json();
     const summary = gptData.choices[0].message.content;
 
-    // ---------- 3a. contactId nahi mila — From number se search karo ----------
-    // From = customer, To = agent/business — hamesha customer (From) se search karo
+    // ---------- 3a. contactId nahi mila — phone number se search karo ----------
+    // Outbound mein To = customer, Inbound mein From = customer
     if (!contactId) {
-      const searchPhone = From !== 'unknown' ? From : To;
+      // Dono try karo — jo 'unknown' nahi woh use karo
+      const searchPhone = From !== 'unknown' ? From : (To !== 'unknown' ? To : null);
 
-      if (searchPhone === 'unknown') {
-        throw new Error('No phone number available for contact search');
+      if (!searchPhone) {
+        throw new Error('No phone number available for contact search — both From and To are unknown');
       }
 
       const searchRes = await fetch(
