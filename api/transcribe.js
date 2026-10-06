@@ -1,13 +1,18 @@
 // ============================================================
 // STEP 1: GHL/Twilio recording-status webhook yahan hit karta hai
 // Iska kaam: turant "OK" bolna aur asli kaam QStash ko dena
+// Supports: JSON (GHL) aur form-urlencoded (Twilio direct) dono
 // ============================================================
 
 import { Client } from '@upstash/qstash';
+import { URLSearchParams } from 'url';
 
-const qstash = new Client({ token: process.env.QSTASH_TOKEN });
+const qstash = new Client({
+  token: process.env.QSTASH_TOKEN,
+  // EU region ke liye baseUrl explicitly set karo
+  ...(process.env.QSTASH_URL && { baseUrl: process.env.QSTASH_URL }),
+});
 
-// Raw body chahiye taake sahi parse ho sake
 export const config = {
   api: { bodyParser: false },
 };
@@ -18,6 +23,19 @@ async function getRawBody(req) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+// GHL JSON aur Twilio form-urlencoded dono parse karta hai
+function parseBody(rawBody, contentType) {
+  const ct = (contentType || '').toLowerCase();
+  if (ct.includes('application/x-www-form-urlencoded')) {
+    return Object.fromEntries(new URLSearchParams(rawBody));
+  }
+  try {
+    return JSON.parse(rawBody);
+  } catch {
+    return null;
+  }
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).send('Method not allowed');
@@ -25,37 +43,65 @@ export default async function handler(req, res) {
 
   try {
     const rawBody = await getRawBody(req);
+    const contentType = req.headers['content-type'] || '';
 
-    // Debug: raw body log karo taake format pata chale
-    console.log('RAW BODY:', rawBody.substring(0, 500));
+    console.log('transcribe: Content-Type:', contentType);
+    console.log('transcribe: RAW BODY (first 500):', rawBody.substring(0, 500));
 
-    let body;
-    try {
-      body = JSON.parse(rawBody);
-    } catch (e) {
-      console.error('JSON parse failed:', e.message);
-      return res.status(200).send('Invalid JSON, ignoring');
+    const body = parseBody(rawBody, contentType);
+    if (!body) {
+      console.error('transcribe: Body parse failed — not JSON or form-urlencoded');
+      return res.status(200).send('Unparseable body, ignoring');
     }
 
-    // Debug: parsed body log karo
-    console.log('PARSED BODY keys:', Object.keys(body));
+    console.log('transcribe: PARSED BODY keys:', Object.keys(body));
 
-    // GHL nested format se parameters nikalo
-    const parameters = body?.data?.requestData?.parameters || body?.data?.parameters || body;
+    // GHL 3 nested formats handle karo
+    const parameters =
+      body?.data?.requestData?.parameters ||
+      body?.data?.parameters ||
+      body;
 
-    console.log('PARAMETERS:', JSON.stringify(parameters).substring(0, 300));
+    console.log('transcribe: PARAMETERS (first 300):', JSON.stringify(parameters).substring(0, 300));
 
-    const RecordingUrl    = parameters?.['Recording Url']    || parameters?.RecordingUrl;
-    const CallSid         = parameters?.['Call Sid']         || parameters?.CallSid;
-    const RecordingStatus = parameters?.['Recording Status'] || parameters?.RecordingStatus;
+    // Twilio direct fields AND GHL spaced fields dono handle karo
+    const RecordingUrl =
+      parameters?.RecordingUrl ||
+      parameters?.['Recording Url'] ||
+      parameters?.recording_url ||
+      null;
 
-    console.log(`RecordingUrl: ${RecordingUrl}, Status: ${RecordingStatus}`);
+    const CallSid =
+      parameters?.CallSid ||
+      parameters?.['Call Sid'] ||
+      parameters?.call_sid ||
+      null;
 
-    // messageId — pehle direct fields check karo, phir sirf valid URL fields se nikalo
+    const RecordingStatus =
+      parameters?.RecordingStatus ||
+      parameters?.['Recording Status'] ||
+      parameters?.recording_status ||
+      null;
+
+    // From: Twilio = 'From', GHL = 'CallerNumber'
+    const From =
+      parameters?.From ||
+      parameters?.CallerNumber ||
+      parameters?.caller ||
+      null;
+
+    // To: Twilio = 'To', GHL = 'Called'
+    const To =
+      parameters?.To ||
+      parameters?.Called ||
+      parameters?.called ||
+      null;
+
+    console.log(`transcribe: RecordingUrl=${RecordingUrl}, Status=${RecordingStatus}, From=${From}, To=${To}`);
+
+    // messageId — GHL se aata hai URL params ya body mein
     let messageId = body?.data?.messageId || body?.messageId || null;
-
     if (!messageId) {
-      // Sirf woh fields check karo jo actual URLs ho sakti hain
       const urlCandidates = [
         body?.data?.requestUrl,
         body?.data?.url,
@@ -68,30 +114,32 @@ export default async function handler(req, res) {
       }
     }
 
-    console.log(`MessageId: ${messageId}`);
+    console.log(`transcribe: CallSid=${CallSid}, MessageId=${messageId}`);
 
-    // Sirf completed recordings process karo — agar status missing ya non-completed ho, ignore karo
-    if (RecordingStatus !== 'completed') {
-      console.log(`Skipping — RecordingStatus: ${RecordingStatus}`);
+    // Sirf completed recordings process karo
+    const statusLower = RecordingStatus?.toLowerCase();
+    if (statusLower && statusLower !== 'completed') {
+      console.log(`transcribe: Skipping — RecordingStatus: ${RecordingStatus}`);
       return res.status(200).send('Recording not completed yet, ignoring');
     }
 
     if (!RecordingUrl) {
+      console.log('transcribe: No RecordingUrl found — ignoring');
       return res.status(200).send('No recording URL found, ignoring');
     }
 
-    // Queue mein job daal do — deduplicationId se same call dobara process nahi hogi
+    // QStash ko queue karo — deduplication CallSid ya messageId se
+    const dedupId = CallSid || messageId;
     const publishOptions = {
       url: `${process.env.PUBLIC_APP_URL}/api/process-call`,
-      body: { RecordingUrl, CallSid, messageId },
+      body: { RecordingUrl, CallSid, messageId, From, To },
       retries: 3,
     };
-    // Sirf tab deduplicationId set karo jab CallSid actually available ho
-    if (CallSid) publishOptions.deduplicationId = CallSid;
+    if (dedupId) publishOptions.deduplicationId = dedupId;
 
     await qstash.publishJSON(publishOptions);
 
-    console.log('Successfully queued to QStash');
+    console.log(`transcribe: Successfully queued — CallSid=${CallSid}, From=${From}, To=${To}`);
     return res.status(200).send('Queued');
 
   } catch (err) {

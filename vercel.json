@@ -6,8 +6,11 @@
     "api/process-call.js": {
       "maxDuration": 10
     },
+    "api/whisper.js": {
+      "maxDuration": 60
+    },
     "api/summarize.js": {
-      "maxDuration": 10
+      "maxDuration": 60
     }
   }
 }

@@ -1,5 +1,5 @@
 // ============================================================
-// STEP 3: QStash yahan call karta hai (process-call.js ke baad)
+// STEP 4: QStash yahan call karta hai (whisper.js ke baad)
 // Kaam: GPT se summarize karo, GHL contact dhundho, note add karo
 // ============================================================
 
@@ -26,7 +26,7 @@ export default async function handler(req, res) {
 
   const rawBody = await getRawBody(req);
 
-  // --- QStash signature verify ---
+  // QStash signature verify
   try {
     const isValid = await receiver.verify({
       signature: req.headers['upstash-signature'],
@@ -34,24 +34,33 @@ export default async function handler(req, res) {
     });
     if (!isValid) return res.status(401).send('Invalid signature');
   } catch (err) {
-    console.error('Signature verification failed:', err);
+    console.error('summarize: Signature verification failed:', err);
     return res.status(401).send('Invalid signature');
   }
 
-  const { transcript, CallSid, messageId } = JSON.parse(rawBody);
+  const {
+    transcript,
+    CallSid,
+    messageId,
+    From: fromPayload,
+    To: toPayload,
+  } = JSON.parse(rawBody);
 
+  // Transcript missing = permanent failure — 400 se QStash retry nahi karega
   if (!transcript) {
-    // 500 taake QStash retry kare — missing transcript transient issue ho sakta hai
-    return res.status(500).json({ error: 'Missing transcript' });
+    console.error('summarize: Missing transcript in payload');
+    return res.status(400).json({ error: 'Missing transcript' });
   }
 
   try {
-    // ---------- 1. GHL se contactId lo ----------
-    let From = 'unknown';
-    let To = 'unknown';
+    // ---------- 1. GHL se contactId nikalo ----------
+    // From/To payload se lo (transcribe.js ne forward kiye hain)
+    // null rakho 'unknown' string nahi — taake phone search sahi kaam kare
+    let From = fromPayload || null;
+    let To   = toPayload   || null;
     let contactId = null;
 
-    // Pehle messageId se try karo
+    // messageId se GHL conversation message try karo
     if (messageId) {
       const msgRes = await fetch(
         `https://services.leadconnectorhq.com/conversations/messages/${messageId}`,
@@ -67,41 +76,22 @@ export default async function handler(req, res) {
       if (msgRes.ok) {
         const msgData = await msgRes.json();
         const msg = msgData?.message || msgData;
-        From      = msg?.from      || 'unknown';
-        To        = msg?.to        || 'unknown';
+        From      = msg?.from      || From;
+        To        = msg?.to        || To;
         contactId = msg?.contactId || null;
+        console.log(`summarize: GHL message found — contactId=${contactId}, From=${From}, To=${To}`);
       } else {
-        console.warn(`GHL message fetch failed: ${msgRes.status}`);
+        console.warn(`summarize: GHL message fetch failed (${msgRes.status}) — falling back to phone search`);
       }
     }
 
-    // Agar messageId se nahi mila toh CallSid se GHL call record dhundho
-    if (!contactId && CallSid) {
-      const callRes = await fetch(
-        `https://services.leadconnectorhq.com/conversations/calls/${CallSid}`,
-        {
-          method: 'GET',
-          headers: {
-            Authorization: `Bearer ${process.env.GHL_API_KEY}`,
-            Version: '2021-07-28',
-          },
-        }
-      );
+    console.log(`summarize: After messageId lookup — contactId=${contactId ?? 'null'}, From=${From}, To=${To}`);
 
-      if (callRes.ok) {
-        const callData = await callRes.json();
-        From      = callData?.from      || callData?.callerNumber || 'unknown';
-        To        = callData?.to        || callData?.dialedNumber || 'unknown';
-        contactId = callData?.contactId || null;
-        console.log(`GHL call record found — From: ${From}, To: ${To}, ContactId: ${contactId}`);
-      } else {
-        console.warn(`GHL call fetch failed: ${callRes.status}`);
-      }
+    // ---------- 2. GPT se summarize karo ----------
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error('OPENAI_API_KEY env variable missing');
     }
 
-    console.log(`Summarizing — From: ${From}, To: ${To}, ContactId: ${contactId}`);
-
-    // ---------- 2. GPT summarization ----------
     const gptRes = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -114,7 +104,7 @@ export default async function handler(req, res) {
           {
             role: 'system',
             content:
-              'Aap ek sales call summarizer hain. Call transcript ko 3-4 concise bullet points mein summarize karein, key points aur next steps highlight karein.',
+              'You are a sales call summarizer. Summarize the call transcript into 3-4 concise bullet points highlighting key discussion points and next steps.',
           },
           { role: 'user', content: transcript },
         ],
@@ -123,43 +113,56 @@ export default async function handler(req, res) {
 
     if (!gptRes.ok) {
       const errText = await gptRes.text();
-      throw new Error(`GPT failed: ${errText}`);
+      throw new Error(`GPT failed (${gptRes.status}): ${errText}`);
     }
 
     const gptData = await gptRes.json();
-    const summary = gptData.choices[0].message.content;
+    const summary = gptData?.choices?.[0]?.message?.content;
 
-    // ---------- 3a. contactId nahi mila — phone number se search karo ----------
-    // Outbound mein To = customer, Inbound mein From = customer
+    if (!summary) {
+      throw new Error('GPT returned empty summary');
+    }
+
+    console.log(`summarize: GPT done — summary length=${summary.length} chars`);
+
+    // ---------- 3. contactId nahi mila — phone number se search karo ----------
     if (!contactId) {
-      // Dono try karo — jo 'unknown' nahi woh use karo
-      const searchPhone = From !== 'unknown' ? From : (To !== 'unknown' ? To : null);
+      // Inbound: From = customer, Outbound: To = customer — dono try karo
+      const searchPhone = From || To || null;
 
       if (!searchPhone) {
-        throw new Error('No phone number available for contact search — both From and To are unknown');
+        throw new Error(
+          'No phone number available — From and To both null, cannot find GHL contact'
+        );
       }
 
+      console.log(`summarize: Searching GHL contact by phone=${searchPhone}`);
+
+      // IMPORTANT: /contacts/search/duplicate ke liye correct version = 2021-04-15
       const searchRes = await fetch(
         `https://services.leadconnectorhq.com/contacts/search/duplicate?locationId=${process.env.GHL_LOCATION_ID}&phone=${encodeURIComponent(searchPhone)}`,
         {
           method: 'GET',
           headers: {
             Authorization: `Bearer ${process.env.GHL_API_KEY}`,
-            Version: '2021-07-28',
+            Version: '2021-04-15',
           },
         }
       );
 
-      if (!searchRes.ok) {
+      if (searchRes.ok) {
+        const searchData = await searchRes.json();
+        contactId = searchData?.contact?.id || null;
+        console.log(`summarize: Phone search result — contactId=${contactId ?? 'not found'}`);
+      } else {
         const errText = await searchRes.text();
-        throw new Error(`GHL contact search failed: ${errText}`);
+        console.warn(`summarize: GHL phone search failed (${searchRes.status}): ${errText}`);
       }
 
-      const searchData = await searchRes.json();
-      contactId = searchData?.contact?.id;
-
-      // ---------- 3b. Contact nahi mila — naya banao ----------
+      // ---------- 4. Contact nahi mila — naya banao ----------
       if (!contactId) {
+        console.log(`summarize: Creating new GHL contact — phone=${searchPhone}`);
+
         const createRes = await fetch(
           'https://services.leadconnectorhq.com/contacts/',
           {
@@ -178,20 +181,36 @@ export default async function handler(req, res) {
 
         if (!createRes.ok) {
           const errText = await createRes.text();
-          throw new Error(`GHL contact create failed: ${errText}`);
+          throw new Error(`GHL contact create failed (${createRes.status}): ${errText}`);
         }
 
         const createData = await createRes.json();
-        contactId = createData?.contact?.id;
+        contactId = createData?.contact?.id || null;
+        console.log(`summarize: New contact created — contactId=${contactId}`);
       }
     }
 
     if (!contactId) {
-      throw new Error(`No contactId found — cannot add note. From: ${From}, To: ${To}`);
+      throw new Error(
+        `No contactId found — cannot add note. From=${From}, To=${To}`
+      );
     }
 
-    // ---------- 4. GHL contact note add karo ----------
-    const noteBody = `📞 Call Summary (${new Date().toLocaleString('en-AU', { timeZone: 'Australia/Sydney' })})\nFrom: ${From} → To: ${To}\n\n${summary}\n\n---\n📝 Full Transcript:\n${transcript}`;
+    // ---------- 5. GHL contact mein note add karo ----------
+    const timestamp = new Date().toLocaleString('en-AU', {
+      timeZone: 'Australia/Sydney',
+    });
+
+    const noteBody = [
+      `📞 Call Summary (${timestamp})`,
+      `From: ${From ?? 'unknown'} → To: ${To ?? 'unknown'}`,
+      '',
+      summary,
+      '',
+      '---',
+      '📝 Full Transcript:',
+      transcript,
+    ].join('\n');
 
     const noteRes = await fetch(
       `https://services.leadconnectorhq.com/contacts/${contactId}/notes`,
@@ -208,14 +227,17 @@ export default async function handler(req, res) {
 
     if (!noteRes.ok) {
       const errText = await noteRes.text();
-      throw new Error(`GHL note creation failed: ${errText}`);
+      throw new Error(`GHL note creation failed (${noteRes.status}): ${errText}`);
     }
 
-    console.log(`Call ${CallSid} summarized and noted — From: ${From}, To: ${To}`);
+    console.log(
+      `summarize: Note added successfully — contactId=${contactId}, CallSid=${CallSid ?? 'unknown'}`
+    );
     return res.status(200).json({ status: 'done', summary });
 
   } catch (err) {
-    console.error('summarize error:', err);
+    console.error('summarize error:', err.message);
+    // 500 taake QStash retry kare — transient failures ke liye
     return res.status(500).json({ error: err.message });
   }
 }
