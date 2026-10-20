@@ -155,39 +155,24 @@ export default async function handler(req, res) {
     }
 
     // -------------------------------------------------------
-    // Twilio API se recording fetch karo
+    // QStash ko queue karo — 2 minute delay
+    // Twilio recording process hone mein time lagta hai
+    // delay se ensure hoga ke recording ready ho
     // -------------------------------------------------------
-    console.log(`transcribe: Fetching recording from Twilio API for CallSid=${CallSid}`);
+    const DELAY_SECONDS = 120; // 2 minutes
 
-    let RecordingUrl, From, To;
-
-    try {
-      const recordingData = await fetchRecordingForCall(CallSid);
-      RecordingUrl = recordingData.recordingUrl;
-      From         = recordingData.from;
-      To           = recordingData.to;
-    } catch (err) {
-      console.error(`transcribe: Recording fetch failed: ${err.message}`);
-      // 500 = QStash retry karega — recording abhi ready nahi hogi
-      return res.status(500).send(`Recording not ready yet: ${err.message}`);
-    }
-
-    console.log(`transcribe: RecordingUrl=${RecordingUrl}, From=${From}, To=${To}`);
-
-    // -------------------------------------------------------
-    // QStash ko queue karo
-    // -------------------------------------------------------
     const dedupId = CallSid || messageId;
     const publishOptions = {
       url: `${process.env.PUBLIC_APP_URL}/api/process-call`,
-      body: { RecordingUrl, CallSid, messageId, From, To },
+      body: { CallSid, messageId },
       retries: 3,
+      delay: DELAY_SECONDS,
     };
     if (dedupId) publishOptions.deduplicationId = dedupId;
 
     await qstash.publishJSON(publishOptions);
 
-    console.log(`transcribe: Successfully queued — CallSid=${CallSid}, From=${From}, To=${To}`);
+    console.log(`transcribe: Queued with ${DELAY_SECONDS}s delay — CallSid=${CallSid}, MessageId=${messageId}`);
     return res.status(200).send('Queued');
 
   } catch (err) {

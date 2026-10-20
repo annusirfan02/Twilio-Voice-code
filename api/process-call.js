@@ -1,6 +1,7 @@
 // ============================================================
 // STEP 2: QStash yahan call karta hai (transcribe.js ke baad)
-// Kaam: QStash signature verify karo aur whisper.js ko queue karo
+// 2 minute delay ke baad aata hai — recording ready hoti hai
+// Kaam: Twilio API se recording fetch karo, whisper.js ko queue karo
 // ============================================================
 
 import { Receiver, Client } from '@upstash/qstash';
@@ -12,7 +13,6 @@ const receiver = new Receiver({
 
 const qstash = new Client({
   token: process.env.QSTASH_TOKEN,
-  // EU region ke liye baseUrl explicitly set karo
   ...(process.env.QSTASH_URL && { baseUrl: process.env.QSTASH_URL }),
 });
 
@@ -26,12 +26,57 @@ async function getRawBody(req) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+// Twilio API se CallSid ki recording fetch karo
+async function fetchRecordingForCall(callSid) {
+  const twilioAuth = Buffer.from(
+    `${process.env.TWILIO_SID}:${process.env.TWILIO_AUTH_TOKEN}`
+  ).toString('base64');
+
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Calls/${callSid}/Recordings.json`;
+
+  console.log(`process-call: Fetching recordings — url=${url}`);
+
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: { Authorization: `Basic ${twilioAuth}` },
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Twilio Recordings API failed (${res.status}): ${errText}`);
+  }
+
+  const data = await res.json();
+  const recordings = data?.recordings || [];
+
+  console.log(`process-call: Found ${recordings.length} recording(s) for CallSid=${callSid}`);
+
+  if (recordings.length === 0) {
+    throw new Error(`No recordings found for CallSid: ${callSid}`);
+  }
+
+  // Pehli recording lo
+  const recording = recordings[0];
+  const recordingSid = recording.sid;
+
+  // RecordingUrl — .mp3 extension ke saath
+  const recordingUrl = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Recordings/${recordingSid}.mp3`;
+
+  console.log(`process-call: RecordingSid=${recordingSid}, From=${recording.from}, To=${recording.to}`);
+
+  return {
+    recordingUrl,
+    from: recording.from || null,
+    to:   recording.to   || null,
+  };
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method not allowed');
 
   const rawBody = await getRawBody(req);
 
-  // QStash signature verify karo — fake requests block honge
+  // QStash signature verify karo
   try {
     const isValid = await receiver.verify({
       signature: req.headers['upstash-signature'],
@@ -43,27 +88,27 @@ export default async function handler(req, res) {
     return res.status(401).send('Invalid signature');
   }
 
-  const { RecordingUrl, CallSid, messageId, From, To } = JSON.parse(rawBody);
+  const { CallSid, messageId } = JSON.parse(rawBody);
 
-  if (!RecordingUrl) {
-    console.warn('process-call: No RecordingUrl in payload — cannot process');
-    return res.status(400).json({ error: 'Missing RecordingUrl' });
+  if (!CallSid) {
+    console.warn('process-call: No CallSid in payload — cannot process');
+    return res.status(400).json({ error: 'Missing CallSid' });
   }
 
-  const callId = CallSid || messageId;
-  if (!callId) {
-    console.warn('process-call: No CallSid or messageId — deduplication not possible');
-  }
-
-  // Twilio kabhi kabhi URL mein already .mp3 extension deta hai
-  // Double extension (.mp3.mp3) avoid karo
-  const audioUrl = RecordingUrl.endsWith('.mp3')
-    ? RecordingUrl
-    : `${RecordingUrl}.mp3`;
-
-  console.log(`process-call: audioUrl=${audioUrl}, callId=${callId ?? 'unknown'}`);
+  console.log(`process-call: Processing — CallSid=${CallSid}, MessageId=${messageId}`);
 
   try {
+    // Twilio API se recording fetch karo
+    // Ab 2 min baad aa rahe hain — recording ready hogi
+    const recordingData = await fetchRecordingForCall(CallSid);
+
+    const audioUrl = recordingData.recordingUrl;
+    const From     = recordingData.from;
+    const To       = recordingData.to;
+
+    const callId = CallSid;
+
+    // whisper.js ko queue karo
     const whisperOptions = {
       url: `${process.env.PUBLIC_APP_URL}/api/whisper`,
       body: {
@@ -79,11 +124,12 @@ export default async function handler(req, res) {
 
     await qstash.publishJSON(whisperOptions);
 
-    console.log(`process-call: Queued whisper job — callId=${callId ?? 'unknown'}`);
+    console.log(`process-call: Queued whisper job — callId=${callId}, audioUrl=${audioUrl}`);
     return res.status(200).json({ status: 'queued for whisper transcription' });
 
   } catch (err) {
-    console.error('process-call error:', err);
+    console.error('process-call error:', err.message);
+    // 500 = QStash retry karega
     return res.status(500).json({ error: err.message });
   }
 }
