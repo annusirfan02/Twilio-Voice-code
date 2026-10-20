@@ -11,7 +11,7 @@ import { Client } from '@upstash/qstash';
 
 const qstash = new Client({
   token: process.env.QSTASH_TOKEN,
-  ...(process.env.QSTASH_URL && { baseUrl: process.env.QSTASH_URL }),
+  baseUrl: process.env.QSTASH_URL?.trim() || 'https://qstash.upstash.io',
 });
 
 export const config = {

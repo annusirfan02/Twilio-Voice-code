@@ -23,8 +23,7 @@ const receiver = new Receiver({
 
 const qstash = new Client({
   token: process.env.QSTASH_TOKEN,
-  // EU region ke liye baseUrl explicitly set karo
-  ...(process.env.QSTASH_URL && { baseUrl: process.env.QSTASH_URL }),
+  baseUrl: process.env.QSTASH_URL?.trim() || 'https://qstash.upstash.io',
 });
 
 // Agar audio > yeh size ho toh chunks mein toro
