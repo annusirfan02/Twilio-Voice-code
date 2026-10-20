@@ -1,10 +1,10 @@
 // ============================================================
 // STEP 1: Twilio Events webhook yahan hit karta hai
 // Event type: com.twilio.voice.status-callback.recording.processed
-// Payload ek ARRAY hai [{...}] — object nahi
-// CallSid → data.sid se nikalta hai
-// messageId → source URL se nikalta hai
-// Recording fetch 2 min delay ke baad process-call.js mein hoti hai
+// Payload ek ARRAY hai [{...}] — ek se zyada events ho sakte hain
+// RecordingSid → data.sid se nikalta hai (RE_xxx)
+// messageId → source URL se nikalta hai (GHL message ID)
+// Recording fetch delay ke baad process-call.js mein hoti hai
 // ============================================================
 
 import { Client } from '@upstash/qstash';
@@ -13,6 +13,9 @@ const qstash = new Client({
   token: process.env.QSTASH_TOKEN,
   baseUrl: process.env.QSTASH_URL?.trim() || 'https://qstash.upstash.io',
 });
+
+// Recording Twilio pe process hone mein waqt lagta hai
+const DELAY_SECONDS = 120; // 2 minutes
 
 export const config = {
   api: { bodyParser: false },
@@ -24,16 +27,59 @@ async function getRawBody(req) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+// Ek event se RecordingSid aur messageId nikalo — relevant na ho toh null
+function extractJob(event) {
+  const eventType = event?.type || '';
+  if (!eventType.includes('recording.processed')) {
+    console.log(`transcribe: Skipping — event type: ${eventType || '(none)'}`);
+    return null;
+  }
+
+  const params = event?.data?.request?.parameters || event?.data?.parameters || {};
+
+  // data.sid = Recording SID — sirf RE_xxx accept karo
+  const RecordingSid = event?.data?.sid || params?.RecordingSid || null;
+  if (!RecordingSid || !RecordingSid.startsWith('RE')) {
+    console.warn(`transcribe: Invalid/missing RecordingSid: ${RecordingSid}`);
+    return null;
+  }
+
+  // source URL se GHL messageId nikalo
+  let messageId = null;
+  if (event?.source) {
+    try {
+      messageId = new URL(event.source).searchParams.get('messageId') || null;
+    } catch {
+      console.warn('transcribe: Could not parse source URL:', event.source);
+    }
+  }
+  messageId = messageId || params?.messageId || null;
+
+  if (!messageId) {
+    console.warn(`transcribe: No GHL messageId for RecordingSid=${RecordingSid} — contact nahi milega`);
+    return null;
+  }
+
+  return { RecordingSid, messageId };
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).send('Method not allowed');
   }
 
+  // Optional shared secret — webhook URL mein ?secret=xxx lagao
+  // Taake koi bhi fake request na bhej sake
+  if (process.env.WEBHOOK_SECRET) {
+    const secret = new URL(req.url, 'http://localhost').searchParams.get('secret');
+    if (secret !== process.env.WEBHOOK_SECRET) {
+      return res.status(401).send('Unauthorized');
+    }
+  }
+
   try {
     const rawBody = await getRawBody(req);
-    console.log('transcribe: RAW BODY (first 500):', rawBody.substring(0, 500));
 
-    // Payload ek JSON array hai [{...}]
     let parsed;
     try {
       parsed = JSON.parse(rawBody);
@@ -42,88 +88,26 @@ export default async function handler(req, res) {
       return res.status(200).send('Invalid JSON, ignoring');
     }
 
-    // Array ho ya object — normalize karo
-    const event = Array.isArray(parsed) ? parsed[0] : parsed;
+    // Array ho ya object — normalize karo, har event handle karo
+    const events = Array.isArray(parsed) ? parsed : [parsed];
+    const jobs = events.map(extractJob).filter(Boolean);
 
-    if (!event) {
-      console.error('transcribe: Empty event');
-      return res.status(200).send('Empty event, ignoring');
+    if (jobs.length === 0) {
+      return res.status(200).send('No relevant recording events, ignoring');
     }
 
-    const eventType = event?.type || '';
-    const source    = event?.source || '';
-
-    console.log(`transcribe: Event type: ${eventType}`);
-    console.log(`transcribe: Source: ${source}`);
-
-    // Sirf recording.processed aur call.completed handle karo
-    if (
-      eventType &&
-      !eventType.includes('recording.processed') &&
-      !eventType.includes('call.completed')
-    ) {
-      console.log(`transcribe: Skipping — event type: ${eventType}`);
-      return res.status(200).send('Event not relevant, ignoring');
+    for (const { RecordingSid, messageId } of jobs) {
+      await qstash.publishJSON({
+        url: `${process.env.PUBLIC_APP_URL}/api/process-call`,
+        body: { RecordingSid, messageId },
+        retries: 3,
+        delay: DELAY_SECONDS,
+        deduplicationId: `process-${RecordingSid}`,
+      });
+      console.log(`transcribe: Queued with ${DELAY_SECONDS}s delay — RecordingSid=${RecordingSid}, MessageId=${messageId}`);
     }
 
-    // -------------------------------------------------------
-    // CallSid aur messageId aur RecordingSid nikalo
-    //
-    // data.sid = Recording SID (RE_xxx) — audio URL banane ke liye
-    // source URL phoneCallId = GHL Call ID
-    // source URL messageId = GHL message ID
-    // -------------------------------------------------------
-    let RecordingSid = null;
-    let CallSid      = null;
-    let messageId    = null;
-
-    // data.sid = Recording SID
-    RecordingSid = event?.data?.sid || null;
-
-    // source URL se nikalo
-    if (source) {
-      try {
-        const sourceUrl = new URL(source);
-        messageId = sourceUrl.searchParams.get('messageId')   || null;
-        CallSid   = sourceUrl.searchParams.get('phoneCallId') || null;
-      } catch {
-        console.warn('transcribe: Could not parse source URL:', source);
-      }
-    }
-
-    // Fallback — data.request.parameters se try karo
-    if (!CallSid) {
-      const params = event?.data?.request?.parameters || event?.data?.parameters || {};
-      CallSid   = params?.CallSid || params?.['Call Sid'] || null;
-      messageId = messageId || params?.messageId || null;
-    }
-
-    console.log(`transcribe: RecordingSid=${RecordingSid}, CallSid=${CallSid}, MessageId=${messageId}`);
-
-    if (!RecordingSid && !CallSid) {
-      console.error('transcribe: No RecordingSid or CallSid found — cannot process');
-      return res.status(200).send('No RecordingSid or CallSid found, ignoring');
-    }
-
-    // -------------------------------------------------------
-    // QStash ko queue karo — 2 minute delay
-    // Recording Twilio pe process hone mein waqt lagta hai
-    // -------------------------------------------------------
-    const DELAY_SECONDS = 120; // 2 minutes
-
-    const dedupId = RecordingSid || CallSid || messageId;
-    const publishOptions = {
-      url: `${process.env.PUBLIC_APP_URL}/api/process-call`,
-      body: { RecordingSid, CallSid, messageId },
-      retries: 3,
-      delay: DELAY_SECONDS,
-    };
-    if (dedupId) publishOptions.deduplicationId = dedupId;
-
-    await qstash.publishJSON(publishOptions);
-
-    console.log(`transcribe: Queued with ${DELAY_SECONDS}s delay — RecordingSid=${RecordingSid}, CallSid=${CallSid}, MessageId=${messageId}`);
-    return res.status(200).send('Queued');
+    return res.status(200).send(`Queued ${jobs.length}`);
 
   } catch (err) {
     console.error('transcribe error:', err);

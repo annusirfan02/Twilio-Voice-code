@@ -11,5 +11,8 @@
     "@upstash/qstash": "^2.7.0",
     "form-data": "^4.0.0",
     "node-fetch": "^3.3.2"
+  },
+  "scripts": {
+    "test": "node test/flow.test.mjs"
   }
 }

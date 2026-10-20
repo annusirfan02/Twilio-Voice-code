@@ -141,11 +141,17 @@ export default async function handler(req, res) {
     return res.status(401).send('Invalid signature');
   }
 
-  const { audioUrl, callId, messageId, From, To } = JSON.parse(rawBody);
+  let payload;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch {
+    return res.status(400).json({ error: 'Invalid JSON' });
+  }
+  const { audioUrl, RecordingSid: callId, messageId } = payload;
 
-  if (!audioUrl) {
-    console.warn('whisper: No audioUrl in payload');
-    return res.status(400).json({ error: 'Missing audioUrl' });
+  if (!audioUrl || !messageId) {
+    console.warn('whisper: Missing audioUrl or messageId in payload');
+    return res.status(400).json({ error: 'Missing audioUrl or messageId' });
   }
 
   // Env variables early check — clear error agar missing ho
@@ -220,7 +226,7 @@ export default async function handler(req, res) {
     // ---------- 3. summarize.js ko QStash ke zariye bhejo ----------
     const summarizeOptions = {
       url: `${process.env.PUBLIC_APP_URL}/api/summarize`,
-      body: { transcript, CallSid: callId, messageId, From, To },
+      body: { transcript, RecordingSid: callId, messageId },
       retries: 3,
     };
     if (callId) summarizeOptions.deduplicationId = `summarize-${callId}`;

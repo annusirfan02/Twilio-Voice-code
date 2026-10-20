@@ -1,7 +1,8 @@
 // ============================================================
 // STEP 2: QStash yahan call karta hai (transcribe.js ke baad)
-// 2 minute delay ke baad aata hai — recording ready hoti hai
-// Kaam: RecordingSid se audio URL banao, whisper.js ko queue karo
+// Delay ke baad aata hai — Twilio se check karo recording ready hai ya nahi
+// Ready nahi → 500 return karo, QStash thodi der baad retry karega
+// Ready → audio URL banao, whisper.js ko queue karo
 // ============================================================
 
 import { Receiver, Client } from '@upstash/qstash';
@@ -43,71 +44,61 @@ export default async function handler(req, res) {
     return res.status(401).send('Invalid signature');
   }
 
-  const { RecordingSid, CallSid, messageId } = JSON.parse(rawBody);
+  let payload;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch {
+    return res.status(400).json({ error: 'Invalid JSON' });
+  }
+  const { RecordingSid, messageId } = payload;
 
-  console.log(`process-call: RecordingSid=${RecordingSid}, CallSid=${CallSid}, MessageId=${messageId}`);
+  console.log(`process-call: RecordingSid=${RecordingSid}, MessageId=${messageId}`);
 
-  if (!RecordingSid) {
-    console.warn('process-call: No RecordingSid in payload — cannot process');
-    return res.status(400).json({ error: 'Missing RecordingSid' });
+  if (!RecordingSid || !messageId) {
+    console.warn('process-call: Missing RecordingSid or messageId — cannot process');
+    return res.status(400).json({ error: 'Missing RecordingSid or messageId' });
   }
 
+  const recordingBase = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Recordings/${RecordingSid}`;
+  const twilioAuth = Buffer.from(
+    `${process.env.TWILIO_SID}:${process.env.TWILIO_AUTH_TOKEN}`
+  ).toString('base64');
+
   try {
-    // RecordingSid se seedha audio URL banao — Twilio API call ki zaroorat nahi
-    // Recording SID (RE_xxx) se directly MP3 download hota hai
-    const audioUrl = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Recordings/${RecordingSid}.mp3`;
+    // ---------- 1. Recording ready hai ya nahi ----------
+    const recRes = await fetch(`${recordingBase}.json`, {
+      headers: { Authorization: `Basic ${twilioAuth}` },
+    });
 
-    console.log(`process-call: audioUrl=${audioUrl}`);
-
-    // From aur To Twilio API se fetch karo agar CallSid available ho
-    let From = null;
-    let To   = null;
-
-    if (CallSid) {
-      try {
-        const twilioAuth = Buffer.from(
-          `${process.env.TWILIO_SID}:${process.env.TWILIO_AUTH_TOKEN}`
-        ).toString('base64');
-
-        const callRes = await fetch(
-          `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Calls/${CallSid}.json`,
-          { headers: { Authorization: `Basic ${twilioAuth}` } }
-        );
-
-        if (callRes.ok) {
-          const callData = await callRes.json();
-          From = callData?.from || null;
-          To   = callData?.to   || null;
-          console.log(`process-call: From=${From}, To=${To}`);
-        } else {
-          console.warn(`process-call: Call fetch failed (${callRes.status}) — From/To will be null`);
-        }
-      } catch (err) {
-        console.warn(`process-call: Could not fetch call details: ${err.message}`);
-      }
+    if (!recRes.ok) {
+      // 404 = abhi Twilio pe nahi mili — retry karo
+      throw new Error(`Recording lookup failed (${recRes.status}) — RecordingSid=${RecordingSid}`);
     }
 
-    // whisper.js ko queue karo
-    const callId = CallSid || RecordingSid;
-    const whisperOptions = {
+    const recording = await recRes.json();
+    if (recording?.status !== 'completed') {
+      throw new Error(`Recording not ready yet (status=${recording?.status}) — RecordingSid=${RecordingSid}`);
+    }
+
+    console.log(`process-call: Recording ready — duration=${recording?.duration}s`);
+
+    // ---------- 2. whisper.js ko queue karo ----------
+    await qstash.publishJSON({
       url: `${process.env.PUBLIC_APP_URL}/api/whisper`,
       body: {
-        audioUrl,
-        callId,
+        audioUrl: `${recordingBase}.mp3`,
+        RecordingSid,
         messageId,
-        From,
-        To,
       },
       retries: 3,
-    };
-    if (callId) whisperOptions.deduplicationId = `whisper-${callId}`;
+      deduplicationId: `whisper-${RecordingSid}`,
+    });
 
-    await qstash.publishJSON(whisperOptions);
-
-    console.log(`process-call: Queued whisper job — callId=${callId}`);
+    console.log(`process-call: Queued whisper job — RecordingSid=${RecordingSid}`);
     return res.status(200).json({ status: 'queued for whisper transcription' });
 
   } catch (err) {
+    // 500 taake QStash retry kare — recording thodi der mein ready ho jayegi
     console.error('process-call error:', err.message);
     return res.status(500).json({ error: err.message });
   }
