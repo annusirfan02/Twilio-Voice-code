@@ -1,12 +1,11 @@
 // ============================================================
 // STEP 1: Twilio Events webhook yahan hit karta hai
 // Event type: com.twilio.voice.status-callback.recording.processed
-// Payload mein RecordingUrl nahi hota — CallSid se Twilio API
-// se recording fetch karni padti hai
+// Payload ek ARRAY hai [{...}] — object nahi
+// CallSid aur messageId source URL mein hote hain
 // ============================================================
 
 import { Client } from '@upstash/qstash';
-import { URLSearchParams } from 'url';
 
 const qstash = new Client({
   token: process.env.QSTASH_TOKEN,
@@ -21,19 +20,6 @@ async function getRawBody(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   return Buffer.concat(chunks).toString('utf8');
-}
-
-// JSON ya form-urlencoded dono parse karta hai
-function parseBody(rawBody, contentType) {
-  const ct = (contentType || '').toLowerCase();
-  if (ct.includes('application/x-www-form-urlencoded')) {
-    return Object.fromEntries(new URLSearchParams(rawBody));
-  }
-  try {
-    return JSON.parse(rawBody);
-  } catch {
-    return null;
-  }
 }
 
 // Twilio API se CallSid ki recording fetch karo
@@ -61,20 +47,18 @@ async function fetchRecordingForCall(callSid) {
     throw new Error(`No recordings found for CallSid: ${callSid}`);
   }
 
-  // Pehli recording lo (latest)
+  // Pehli recording lo
   const recording = recordings[0];
   const recordingSid = recording.sid;
 
-  // RecordingUrl banao
   const recordingUrl = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Recordings/${recordingSid}`;
 
-  console.log(`transcribe: Recording found — RecordingSid=${recordingSid}, CallSid=${callSid}`);
+  console.log(`transcribe: Recording found — RecordingSid=${recordingSid}`);
 
   return {
     recordingUrl,
-    recordingSid,
     from: recording.from || null,
-    to: recording.to || null,
+    to:   recording.to   || null,
   };
 }
 
@@ -85,113 +69,104 @@ export default async function handler(req, res) {
 
   try {
     const rawBody = await getRawBody(req);
-    const contentType = req.headers['content-type'] || '';
-
-    console.log('transcribe: Content-Type:', contentType);
     console.log('transcribe: RAW BODY (first 500):', rawBody.substring(0, 500));
 
-    const body = parseBody(rawBody, contentType);
-    if (!body) {
-      console.error('transcribe: Body parse failed');
-      return res.status(200).send('Unparseable body, ignoring');
+    // -------------------------------------------------------
+    // Parse — payload ek JSON array hai [{...}]
+    // -------------------------------------------------------
+    let parsed;
+    try {
+      parsed = JSON.parse(rawBody);
+    } catch (e) {
+      console.error('transcribe: JSON parse failed:', e.message);
+      return res.status(200).send('Invalid JSON, ignoring');
     }
 
-    // -------------------------------------------------------
-    // Event type check — sirf recording.processed handle karo
-    // -------------------------------------------------------
-    const eventType = body?.type || '';
-    console.log(`transcribe: Event type: ${eventType}`);
+    // Array ho ya object — normalize karo
+    const event = Array.isArray(parsed) ? parsed[0] : parsed;
 
+    if (!event) {
+      console.error('transcribe: Empty event');
+      return res.status(200).send('Empty event, ignoring');
+    }
+
+    const eventType = event?.type || '';
+    const source    = event?.source || '';
+
+    console.log(`transcribe: Event type: ${eventType}`);
+    console.log(`transcribe: Source: ${source}`);
+
+    // Sirf recording.processed aur call.completed handle karo
     if (
       eventType &&
       !eventType.includes('recording.processed') &&
       !eventType.includes('call.completed')
     ) {
-      console.log(`transcribe: Skipping event type: ${eventType}`);
-      return res.status(200).send('Event type not relevant, ignoring');
+      console.log(`transcribe: Skipping — event type: ${eventType}`);
+      return res.status(200).send('Event not relevant, ignoring');
     }
 
     // -------------------------------------------------------
-    // CallSid nikalo — naye format mein data.sid mein hota hai
-    // Purane format mein parameters.CallSid mein
+    // CallSid aur messageId nikalo
+    // Source URL mein hote hain:
+    // ?phoneCallId=CA_xxx&messageId=xxx
     // -------------------------------------------------------
-    const parameters =
-      body?.data?.requestData?.parameters ||
-      body?.data?.parameters ||
-      body?.data?.request?.parameters ||
-      body;
+    let CallSid   = null;
+    let messageId = null;
 
-    const CallSid =
-      body?.data?.sid ||           // naya Twilio Events format
-      parameters?.CallSid ||        // purana format
-      parameters?.['Call Sid'] ||
-      parameters?.call_sid ||
-      null;
-
-    // messageId — GHL se aata hai
-    let messageId = body?.data?.messageId || body?.messageId || null;
-    if (!messageId) {
-      const urlCandidates = [
-        body?.data?.requestUrl,
-        body?.data?.url,
-        body?.data?.request?.url,
-        body?.requestUrl,
-      ].filter(Boolean);
-
-      for (const url of urlCandidates) {
-        const match = url.match(/messageId=([^&]+)/);
-        if (match) { messageId = match[1]; break; }
+    // Source URL se nikalo
+    if (source) {
+      try {
+        const sourceUrl = new URL(source);
+        CallSid   = sourceUrl.searchParams.get('phoneCallId') || null;
+        messageId = sourceUrl.searchParams.get('messageId')   || null;
+      } catch {
+        console.warn('transcribe: Could not parse source URL:', source);
       }
+    }
+
+    // Fallback — data.sid se try karo
+    if (!CallSid) {
+      CallSid = event?.data?.sid || null;
+    }
+
+    // Fallback — data.request.parameters se try karo
+    if (!CallSid) {
+      const params = event?.data?.request?.parameters || event?.data?.parameters || {};
+      CallSid   = params?.CallSid   || params?.['Call Sid']   || null;
+      messageId = messageId || params?.messageId || null;
     }
 
     console.log(`transcribe: CallSid=${CallSid}, MessageId=${messageId}`);
 
     if (!CallSid) {
-      console.error('transcribe: No CallSid found in payload');
+      console.error('transcribe: No CallSid found — cannot process');
       return res.status(200).send('No CallSid found, ignoring');
     }
 
     // -------------------------------------------------------
-    // Pehle check karo kya RecordingUrl directly available hai
-    // (purana format) — agar nahi toh Twilio API se fetch karo
+    // Twilio API se recording fetch karo
     // -------------------------------------------------------
-    let RecordingUrl =
-      parameters?.RecordingUrl ||
-      parameters?.['Recording Url'] ||
-      parameters?.recording_url ||
-      null;
+    console.log(`transcribe: Fetching recording from Twilio API for CallSid=${CallSid}`);
 
-    let From =
-      parameters?.From ||
-      parameters?.CallerNumber ||
-      parameters?.caller ||
-      null;
+    let RecordingUrl, From, To;
 
-    let To =
-      parameters?.To ||
-      parameters?.Called ||
-      parameters?.called ||
-      null;
-
-    if (!RecordingUrl) {
-      // Naya format — Twilio API se recording fetch karo
-      console.log(`transcribe: No RecordingUrl in payload — fetching from Twilio API for CallSid=${CallSid}`);
-
-      try {
-        const recordingData = await fetchRecordingForCall(CallSid);
-        RecordingUrl = recordingData.recordingUrl;
-        From = From || recordingData.from;
-        To   = To   || recordingData.to;
-      } catch (err) {
-        console.error(`transcribe: Failed to fetch recording: ${err.message}`);
-        // 500 taake retry ho sake — recording abhi ready nahi hogi
-        return res.status(500).send(`Failed to fetch recording: ${err.message}`);
-      }
+    try {
+      const recordingData = await fetchRecordingForCall(CallSid);
+      RecordingUrl = recordingData.recordingUrl;
+      From         = recordingData.from;
+      To           = recordingData.to;
+    } catch (err) {
+      console.error(`transcribe: Recording fetch failed: ${err.message}`);
+      // 500 = QStash retry karega — recording abhi ready nahi hogi
+      return res.status(500).send(`Recording not ready yet: ${err.message}`);
     }
 
     console.log(`transcribe: RecordingUrl=${RecordingUrl}, From=${From}, To=${To}`);
 
+    // -------------------------------------------------------
     // QStash ko queue karo
+    // -------------------------------------------------------
     const dedupId = CallSid || messageId;
     const publishOptions = {
       url: `${process.env.PUBLIC_APP_URL}/api/process-call`,
