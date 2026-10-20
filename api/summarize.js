@@ -27,12 +27,49 @@ async function getRawBody(req) {
 // GHL_API_KEY "pit-xxx" ho ya "Bearer pit-xxx" — dono chalein, double "Bearer" na bane
 const GHL_TOKEN = (process.env.GHL_API_KEY || '').trim().replace(/^bearer\s+/i, '');
 
+// Kitne pages (100 messages each) tak dhundna hai — newest pehle aate hain
+const EXPORT_MAX_PAGES = 5;
+
 function ghlHeaders(extra = {}) {
   return {
     Authorization: `Bearer ${GHL_TOKEN}`,
     Version: '2021-07-28',
     ...extra,
   };
+}
+
+// GET /conversations/messages/{id} call messages pe 401 deta hai (source/channel mismatch)
+// Is liye export endpoint se dhundho — messageId ya attachment mein RecordingSid match karo
+async function findCallMessage(messageId, RecordingSid) {
+  let cursor = null;
+
+  for (let page = 1; page <= EXPORT_MAX_PAGES; page++) {
+    const params = new URLSearchParams({ locationId: process.env.GHL_LOCATION_ID, limit: '100' });
+    if (cursor) params.set('cursor', cursor);
+
+    const exportRes = await fetch(`${GHL_BASE}/conversations/messages/export?${params}`, {
+      headers: ghlHeaders(),
+    });
+
+    if (!exportRes.ok) {
+      const errText = await exportRes.text();
+      throw new Error(`GHL messages export failed (${exportRes.status}): ${errText}`);
+    }
+
+    const data = await exportRes.json();
+    const match = data?.messages?.find(
+      (m) => m?.id === messageId || m?.attachments?.some((a) => a?.includes(RecordingSid))
+    );
+    if (match) {
+      console.log(`summarize: Found call message on export page ${page}`);
+      return match;
+    }
+
+    cursor = data?.nextCursor;
+    if (!cursor) break;
+  }
+
+  return null;
 }
 
 export default async function handler(req, res) {
@@ -69,21 +106,12 @@ export default async function handler(req, res) {
   try {
     // ---------- 1. GHL messageId se contactId nikalo ----------
     // GPT se pehle — taake contact na mile toh GPT ka paisa waste na ho
-    const msgRes = await fetch(`${GHL_BASE}/conversations/messages/${messageId}`, {
-      headers: ghlHeaders(),
-    });
-
-    if (!msgRes.ok) {
-      const errText = await msgRes.text();
-      throw new Error(`GHL message fetch failed (${msgRes.status}): ${errText}`);
-    }
-
-    const msgData = await msgRes.json();
-    const msg = msgData?.message || msgData;
+    // Nahi mila → 500, QStash retry karega (message thodi der baad export mein aa sakta hai)
+    const msg = await findCallMessage(messageId, RecordingSid);
     const contactId = msg?.contactId || null;
 
     if (!contactId) {
-      throw new Error(`No contactId on GHL message ${messageId}`);
+      throw new Error(`GHL call message not found in export — messageId=${messageId}, RecordingSid=${RecordingSid}`);
     }
 
     console.log(`summarize: GHL message found — contactId=${contactId}`);

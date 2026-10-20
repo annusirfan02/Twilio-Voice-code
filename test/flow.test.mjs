@@ -30,7 +30,16 @@ globalThis.fetch = async (url, opts = {}) => {
   if (/\/Recordings\/RE\w+\.mp3$/.test(url)) return new Response(Buffer.alloc(1000, 1));
   if (url.includes('audio/transcriptions')) return json({ text: 'Customer wants a quote by Friday.' });
   if (url.includes('chat/completions')) return json({ choices: [{ message: { content: '- Quote by Friday' } }] });
-  if (url.includes('conversations/messages')) return S.ghlMsg ? json({ message: S.ghlMsg }) : json({ msg: 'nf' }, 404);
+  if (url.includes('conversations/messages/export')) {
+    // Real GHL: newest first, cursor pagination. Put the call message on page 2 when S.page2.
+    const cur = new URL(url).searchParams.get('cursor');
+    const call = S.ghlMsg ? [{ id: 'GHLMSG1', attachments: ['https://api.twilio.com/.../Recordings/RE1111'], ...S.ghlMsg }] : [];
+    const filler = [{ id: 'OTHER', contactId: 'WRONG', attachments: [] }];
+    if (S.page2 && !cur) return json({ messages: filler, nextCursor: 'c2' });
+    return json({ messages: [...filler, ...call], nextCursor: null });
+  }
+  // Real GHL rejects PIT tokens on call messages
+  if (url.includes('conversations/messages/')) return json({ message: 'Token source/channel mismatch with request source/channel' }, 401);
   if (url.includes('/notes') && method === 'GET') return json({ notes: S.notes });
   if (url.includes('/notes') && method === 'POST') { S.notes.push(JSON.parse(opts.body)); return json({ note: {} }); }
   return json({ error: 'unmocked ' + url }, 500);
@@ -120,6 +129,14 @@ await test('recording not ready yet -> 500 (QStash retries), nothing queued', as
   S.recStatus = null; // 404 from Twilio
   const p2 = await invoke('process-call.js', { RecordingSid: 'RE1111', messageId: 'GHLMSG1' });
   expect(p2.status === 500 && p2.pub.length === 0, '404 should fail and not queue');
+});
+
+await test('call message on 2nd export page is found by RecordingSid (messageId differs)', async () => {
+  S.page2 = true;
+  const s = await invoke('summarize.js', { transcript: 'x', RecordingSid: 'RE1111', messageId: 'SOME_OTHER_ID' });
+  expect(s.status === 200, 'status ' + s.status + ' ' + JSON.stringify(s.body));
+  expect(s.calls.some(c => c.method === 'POST' && c.url.endsWith('/contacts/CONTACT_42/notes')), 'note not on CONTACT_42');
+  expect(s.calls.some(c => c.url.includes('cursor=c2')), 'did not paginate');
 });
 
 await test('GHL message not found -> 500, GPT NOT called, no note', async () => {
