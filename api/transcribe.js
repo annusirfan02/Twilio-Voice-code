@@ -108,32 +108,42 @@ export default async function handler(req, res) {
 
     // -------------------------------------------------------
     // CallSid aur messageId nikalo
-    // Source URL mein hote hain:
-    // ?phoneCallId=CA_xxx&messageId=xxx
+    //
+    // Priority order:
+    // 1. data.sid = actual Twilio CallSid (CA_xxx) ← PRIMARY
+    // 2. source URL ka phoneCallId = GHL internal ID ← FALLBACK only
+    // 3. data.request.parameters.CallSid            ← FALLBACK
+    //
+    // messageId source URL se milta hai
     // -------------------------------------------------------
     let CallSid   = null;
     let messageId = null;
 
-    // Source URL se nikalo
+    // 1. data.sid = real Twilio CallSid — yeh sabse reliable hai
+    CallSid = event?.data?.sid || null;
+
+    // messageId — source URL se nikalo
     if (source) {
       try {
         const sourceUrl = new URL(source);
-        CallSid   = sourceUrl.searchParams.get('phoneCallId') || null;
-        messageId = sourceUrl.searchParams.get('messageId')   || null;
+        messageId = sourceUrl.searchParams.get('messageId') || null;
+        // phoneCallId sirf fallback ke liye — agar data.sid nahi mila
+        if (!CallSid) {
+          const phoneCallId = sourceUrl.searchParams.get('phoneCallId');
+          // Sirf valid Twilio CallSid use karo (CA se shuru hota hai)
+          if (phoneCallId && phoneCallId.startsWith('CA')) {
+            CallSid = phoneCallId;
+          }
+        }
       } catch {
         console.warn('transcribe: Could not parse source URL:', source);
       }
     }
 
-    // Fallback — data.sid se try karo
-    if (!CallSid) {
-      CallSid = event?.data?.sid || null;
-    }
-
     // Fallback — data.request.parameters se try karo
     if (!CallSid) {
       const params = event?.data?.request?.parameters || event?.data?.parameters || {};
-      CallSid   = params?.CallSid   || params?.['Call Sid']   || null;
+      CallSid   = params?.CallSid || params?.['Call Sid'] || null;
       messageId = messageId || params?.messageId || null;
     }
 
