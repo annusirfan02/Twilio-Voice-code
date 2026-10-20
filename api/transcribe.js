@@ -79,6 +79,7 @@ export default async function handler(req, res) {
 
   try {
     const rawBody = await getRawBody(req);
+    console.log('transcribe: RAW BODY:', rawBody.substring(0, 4000));
 
     let parsed;
     try {
