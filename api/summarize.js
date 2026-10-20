@@ -24,9 +24,12 @@ async function getRawBody(req) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+// GHL_API_KEY "pit-xxx" ho ya "Bearer pit-xxx" — dono chalein, double "Bearer" na bane
+const GHL_TOKEN = (process.env.GHL_API_KEY || '').trim().replace(/^bearer\s+/i, '');
+
 function ghlHeaders(extra = {}) {
   return {
-    Authorization: `Bearer ${process.env.GHL_API_KEY}`,
+    Authorization: `Bearer ${GHL_TOKEN}`,
     Version: '2021-07-28',
     ...extra,
   };

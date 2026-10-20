@@ -15,7 +15,7 @@ const APP = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 Object.assign(process.env, {
   QSTASH_TOKEN: 'qtok', QSTASH_CURRENT_SIGNING_KEY: 'sigkey1', QSTASH_NEXT_SIGNING_KEY: 'sigkey2',
   PUBLIC_APP_URL: 'https://app.example.com', TWILIO_SID: 'AC123', TWILIO_AUTH_TOKEN: 'tw',
-  OPENAI_API_KEY: 'sk', GHL_API_KEY: 'ghl', GHL_LOCATION_ID: 'loc1',
+  OPENAI_API_KEY: 'sk', GHL_API_KEY: 'Bearer pit-abc', GHL_LOCATION_ID: 'loc1',
 });
 
 let calls = [];
@@ -134,6 +134,12 @@ await test('QStash retry after success does not create a duplicate note', async 
   const body = { transcript: 'x', RecordingSid: 'RE1111', messageId: 'GHLMSG1' };
   await invoke('summarize.js', body); const r = await invoke('summarize.js', body);
   expect(r.status === 200 && S.notes.length === 1, `notes written: ${S.notes.length}`);
+});
+
+await test('GHL auth header has a single "Bearer" even if env value already includes it', async () => {
+  const s = await invoke('summarize.js', { transcript: 'x', RecordingSid: 'RE1111', messageId: 'GHLMSG1' });
+  const auths = s.calls.filter(c => c.url.includes('leadconnectorhq')).map(c => c.headers.get('authorization'));
+  expect(auths.length && auths.every(a => a === 'Bearer pit-abc'), 'got: ' + auths.join(', '));
 });
 
 await test('malformed JSON returns 400 instead of crashing', async () => {
