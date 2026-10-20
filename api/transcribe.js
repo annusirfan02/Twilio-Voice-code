@@ -1,7 +1,8 @@
 // ============================================================
-// STEP 1: GHL/Twilio recording-status webhook yahan hit karta hai
-// Iska kaam: turant "OK" bolna aur asli kaam QStash ko dena
-// Supports: JSON (GHL) aur form-urlencoded (Twilio direct) dono
+// STEP 1: Twilio Events webhook yahan hit karta hai
+// Event type: com.twilio.voice.status-callback.recording.processed
+// Payload mein RecordingUrl nahi hota — CallSid se Twilio API
+// se recording fetch karni padti hai
 // ============================================================
 
 import { Client } from '@upstash/qstash';
@@ -9,7 +10,6 @@ import { URLSearchParams } from 'url';
 
 const qstash = new Client({
   token: process.env.QSTASH_TOKEN,
-  // EU region ke liye baseUrl explicitly set karo
   ...(process.env.QSTASH_URL && { baseUrl: process.env.QSTASH_URL }),
 });
 
@@ -23,7 +23,7 @@ async function getRawBody(req) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-// GHL JSON aur Twilio form-urlencoded dono parse karta hai
+// JSON ya form-urlencoded dono parse karta hai
 function parseBody(rawBody, contentType) {
   const ct = (contentType || '').toLowerCase();
   if (ct.includes('application/x-www-form-urlencoded')) {
@@ -34,6 +34,48 @@ function parseBody(rawBody, contentType) {
   } catch {
     return null;
   }
+}
+
+// Twilio API se CallSid ki recording fetch karo
+async function fetchRecordingForCall(callSid) {
+  const twilioAuth = Buffer.from(
+    `${process.env.TWILIO_SID}:${process.env.TWILIO_AUTH_TOKEN}`
+  ).toString('base64');
+
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Calls/${callSid}/Recordings.json`;
+
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: { Authorization: `Basic ${twilioAuth}` },
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Twilio Recordings API failed (${res.status}): ${errText}`);
+  }
+
+  const data = await res.json();
+  const recordings = data?.recordings || [];
+
+  if (recordings.length === 0) {
+    throw new Error(`No recordings found for CallSid: ${callSid}`);
+  }
+
+  // Pehli recording lo (latest)
+  const recording = recordings[0];
+  const recordingSid = recording.sid;
+
+  // RecordingUrl banao
+  const recordingUrl = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Recordings/${recordingSid}`;
+
+  console.log(`transcribe: Recording found — RecordingSid=${recordingSid}, CallSid=${callSid}`);
+
+  return {
+    recordingUrl,
+    recordingSid,
+    from: recording.from || null,
+    to: recording.to || null,
+  };
 }
 
 export default async function handler(req, res) {
@@ -50,61 +92,49 @@ export default async function handler(req, res) {
 
     const body = parseBody(rawBody, contentType);
     if (!body) {
-      console.error('transcribe: Body parse failed — not JSON or form-urlencoded');
+      console.error('transcribe: Body parse failed');
       return res.status(200).send('Unparseable body, ignoring');
     }
 
-    console.log('transcribe: PARSED BODY keys:', Object.keys(body));
+    // -------------------------------------------------------
+    // Event type check — sirf recording.processed handle karo
+    // -------------------------------------------------------
+    const eventType = body?.type || '';
+    console.log(`transcribe: Event type: ${eventType}`);
 
-    // GHL 3 nested formats handle karo
+    if (
+      eventType &&
+      !eventType.includes('recording.processed') &&
+      !eventType.includes('call.completed')
+    ) {
+      console.log(`transcribe: Skipping event type: ${eventType}`);
+      return res.status(200).send('Event type not relevant, ignoring');
+    }
+
+    // -------------------------------------------------------
+    // CallSid nikalo — naye format mein data.sid mein hota hai
+    // Purane format mein parameters.CallSid mein
+    // -------------------------------------------------------
     const parameters =
       body?.data?.requestData?.parameters ||
       body?.data?.parameters ||
+      body?.data?.request?.parameters ||
       body;
 
-    console.log('transcribe: PARAMETERS (first 300):', JSON.stringify(parameters).substring(0, 300));
-
-    // Twilio direct fields AND GHL spaced fields dono handle karo
-    const RecordingUrl =
-      parameters?.RecordingUrl ||
-      parameters?.['Recording Url'] ||
-      parameters?.recording_url ||
-      null;
-
     const CallSid =
-      parameters?.CallSid ||
+      body?.data?.sid ||           // naya Twilio Events format
+      parameters?.CallSid ||        // purana format
       parameters?.['Call Sid'] ||
       parameters?.call_sid ||
       null;
 
-    const RecordingStatus =
-      parameters?.RecordingStatus ||
-      parameters?.['Recording Status'] ||
-      parameters?.recording_status ||
-      null;
-
-    // From: Twilio = 'From', GHL = 'CallerNumber'
-    const From =
-      parameters?.From ||
-      parameters?.CallerNumber ||
-      parameters?.caller ||
-      null;
-
-    // To: Twilio = 'To', GHL = 'Called'
-    const To =
-      parameters?.To ||
-      parameters?.Called ||
-      parameters?.called ||
-      null;
-
-    console.log(`transcribe: RecordingUrl=${RecordingUrl}, Status=${RecordingStatus}, From=${From}, To=${To}`);
-
-    // messageId — GHL se aata hai URL params ya body mein
+    // messageId — GHL se aata hai
     let messageId = body?.data?.messageId || body?.messageId || null;
     if (!messageId) {
       const urlCandidates = [
         body?.data?.requestUrl,
         body?.data?.url,
+        body?.data?.request?.url,
         body?.requestUrl,
       ].filter(Boolean);
 
@@ -116,19 +146,52 @@ export default async function handler(req, res) {
 
     console.log(`transcribe: CallSid=${CallSid}, MessageId=${messageId}`);
 
-    // Sirf completed recordings process karo
-    const statusLower = RecordingStatus?.toLowerCase();
-    if (statusLower && statusLower !== 'completed') {
-      console.log(`transcribe: Skipping — RecordingStatus: ${RecordingStatus}`);
-      return res.status(200).send('Recording not completed yet, ignoring');
+    if (!CallSid) {
+      console.error('transcribe: No CallSid found in payload');
+      return res.status(200).send('No CallSid found, ignoring');
     }
+
+    // -------------------------------------------------------
+    // Pehle check karo kya RecordingUrl directly available hai
+    // (purana format) — agar nahi toh Twilio API se fetch karo
+    // -------------------------------------------------------
+    let RecordingUrl =
+      parameters?.RecordingUrl ||
+      parameters?.['Recording Url'] ||
+      parameters?.recording_url ||
+      null;
+
+    let From =
+      parameters?.From ||
+      parameters?.CallerNumber ||
+      parameters?.caller ||
+      null;
+
+    let To =
+      parameters?.To ||
+      parameters?.Called ||
+      parameters?.called ||
+      null;
 
     if (!RecordingUrl) {
-      console.log('transcribe: No RecordingUrl found — ignoring');
-      return res.status(200).send('No recording URL found, ignoring');
+      // Naya format — Twilio API se recording fetch karo
+      console.log(`transcribe: No RecordingUrl in payload — fetching from Twilio API for CallSid=${CallSid}`);
+
+      try {
+        const recordingData = await fetchRecordingForCall(CallSid);
+        RecordingUrl = recordingData.recordingUrl;
+        From = From || recordingData.from;
+        To   = To   || recordingData.to;
+      } catch (err) {
+        console.error(`transcribe: Failed to fetch recording: ${err.message}`);
+        // 500 taake retry ho sake — recording abhi ready nahi hogi
+        return res.status(500).send(`Failed to fetch recording: ${err.message}`);
+      }
     }
 
-    // QStash ko queue karo — deduplication CallSid ya messageId se
+    console.log(`transcribe: RecordingUrl=${RecordingUrl}, From=${From}, To=${To}`);
+
+    // QStash ko queue karo
     const dedupId = CallSid || messageId;
     const publishOptions = {
       url: `${process.env.PUBLIC_APP_URL}/api/process-call`,
