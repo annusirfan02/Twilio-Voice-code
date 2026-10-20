@@ -67,46 +67,42 @@ export default async function handler(req, res) {
     }
 
     // -------------------------------------------------------
-    // CallSid aur messageId nikalo
-    // Priority:
-    // 1. data.sid = actual Twilio CallSid (CA_xxx) ← PRIMARY
-    // 2. source URL phoneCallId (sirf agar CA se shuru ho) ← FALLBACK
-    // 3. data.request.parameters ← FALLBACK
+    // CallSid aur messageId aur RecordingSid nikalo
+    //
+    // data.sid = Recording SID (RE_xxx) — audio URL banane ke liye
+    // source URL phoneCallId = GHL Call ID
+    // source URL messageId = GHL message ID
     // -------------------------------------------------------
-    let CallSid   = null;
-    let messageId = null;
+    let RecordingSid = null;
+    let CallSid      = null;
+    let messageId    = null;
 
-    // 1. data.sid — real Twilio CallSid
-    CallSid = event?.data?.sid || null;
+    // data.sid = Recording SID
+    RecordingSid = event?.data?.sid || null;
 
-    // messageId + CallSid fallback — source URL se
+    // source URL se nikalo
     if (source) {
       try {
         const sourceUrl = new URL(source);
-        messageId = sourceUrl.searchParams.get('messageId') || null;
-        if (!CallSid) {
-          const phoneCallId = sourceUrl.searchParams.get('phoneCallId');
-          if (phoneCallId && phoneCallId.startsWith('CA')) {
-            CallSid = phoneCallId;
-          }
-        }
+        messageId = sourceUrl.searchParams.get('messageId')   || null;
+        CallSid   = sourceUrl.searchParams.get('phoneCallId') || null;
       } catch {
         console.warn('transcribe: Could not parse source URL:', source);
       }
     }
 
-    // 3. data.request.parameters fallback
+    // Fallback — data.request.parameters se try karo
     if (!CallSid) {
       const params = event?.data?.request?.parameters || event?.data?.parameters || {};
       CallSid   = params?.CallSid || params?.['Call Sid'] || null;
       messageId = messageId || params?.messageId || null;
     }
 
-    console.log(`transcribe: CallSid=${CallSid}, MessageId=${messageId}`);
+    console.log(`transcribe: RecordingSid=${RecordingSid}, CallSid=${CallSid}, MessageId=${messageId}`);
 
-    if (!CallSid) {
-      console.error('transcribe: No CallSid found — cannot process');
-      return res.status(200).send('No CallSid found, ignoring');
+    if (!RecordingSid && !CallSid) {
+      console.error('transcribe: No RecordingSid or CallSid found — cannot process');
+      return res.status(200).send('No RecordingSid or CallSid found, ignoring');
     }
 
     // -------------------------------------------------------
@@ -115,10 +111,10 @@ export default async function handler(req, res) {
     // -------------------------------------------------------
     const DELAY_SECONDS = 120; // 2 minutes
 
-    const dedupId = CallSid || messageId;
+    const dedupId = RecordingSid || CallSid || messageId;
     const publishOptions = {
       url: `${process.env.PUBLIC_APP_URL}/api/process-call`,
-      body: { CallSid, messageId },
+      body: { RecordingSid, CallSid, messageId },
       retries: 3,
       delay: DELAY_SECONDS,
     };
@@ -126,7 +122,7 @@ export default async function handler(req, res) {
 
     await qstash.publishJSON(publishOptions);
 
-    console.log(`transcribe: Queued with ${DELAY_SECONDS}s delay — CallSid=${CallSid}, MessageId=${messageId}`);
+    console.log(`transcribe: Queued with ${DELAY_SECONDS}s delay — RecordingSid=${RecordingSid}, CallSid=${CallSid}, MessageId=${messageId}`);
     return res.status(200).send('Queued');
 
   } catch (err) {
